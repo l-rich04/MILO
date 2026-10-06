@@ -1,0 +1,14 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# Personal data: MILO's real logs and voice recordings stay on my machine, never on GitHub
+data/
+*.csv
+*.db
+*.wav
+*.mp3
