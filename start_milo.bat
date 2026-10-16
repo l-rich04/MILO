@@ -1,5 +1,6 @@
 @echo off
 cd /d %~dp0
 call venv\Scripts\activate
-python jarvis.py %*
+python milo.py %*
 pause
+ 

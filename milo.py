@@ -1,7 +1,7 @@
 """
-Jarvis - push-to-talk voice assistant
-  Hold F9 -> speak -> release -> Jarvis transcribes, thinks, acts, and talks back.
-  Press F9 while Jarvis is talking to interrupt.
+MILO - push-to-talk voice assistant
+  Hold F9 -> speak -> release -> MILO transcribes, thinks, acts, and talks back.
+  Press F9 while MILO is talking to interrupt.
   Run with --text to type instead of talk (good for debugging tools).
 
 Stack: faster-whisper (STT) -> Claude w/ tools (brain) -> edge-tts + pygame (TTS)
@@ -22,20 +22,20 @@ import time
 import anthropic
 
 # ─────────────────────────── Config ───────────────────────────
-MODEL = os.getenv("JARVIS_MODEL", "claude-sonnet-5-5")
-WHISPER_MODEL = os.getenv("JARVIS_WHISPER", "small.en")   # tiny.en / base.en / small.en / medium.en
-VOICE = os.getenv("JARVIS_VOICE", "en-GB-RyanNeural")      # `edge-tts --list-voices` for more
-USER_NAME = os.getenv("JARVIS_USER", "Layne")
+MODEL = os.getenv("MILO_MODEL", "claude-sonnet-5-5")
+WHISPER_MODEL = os.getenv("MILO_WHISPER", "small.en")   # tiny.en / base.en / small.en / medium.en
+VOICE = os.getenv("MILO_VOICE", "en-GB-RyanNeural")      # `edge-tts --list-voices` for more
+USER_NAME = os.getenv("MILO_USER", "Layne")
 SAMPLE_RATE = 16000
 MAX_HISTORY = 30          # messages kept in context
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milo.db")
 IS_WINDOWS = platform.system() == "Windows"
 
-SYSTEM_PROMPT = f"""You are Jarvis, a voice assistant running on {USER_NAME}'s computer ({platform.system()}).
+SYSTEM_PROMPT = f"""You are MILO, a voice assistant running on {USER_NAME}'s computer ({platform.system()}).
 Your replies are spoken aloud, so:
 - Keep answers short: 1-3 sentences unless asked for detail.
 - No markdown, bullet points, or code blocks in speech. If you must show code or long output, say it's printed in the console.
-- Be direct and a little dry-witted, like the movie Jarvis, but never at the expense of being useful.
+- Be direct, friendly, and a little witty, but never at the expense of being useful.
 Use tools when they help. For shell commands prefer simple, safe, read-only commands unless the user clearly asks for a change.
 Current date/time is available via the get_datetime tool."""
 
@@ -52,7 +52,7 @@ def db():
 
 # ─────────────────────────── Tools ───────────────────────────
 def confirm(action: str) -> bool:
-    print(f"\n⚠️  Jarvis wants to: {action}")
+    print(f"\n⚠️  MILO wants to: {action}")
     return input("   Allow? [y/N]: ").strip().lower() == "y"
 
 def tool_run_shell_command(command: str) -> str:
@@ -205,7 +205,7 @@ def speak(text: str):
     spoken = clean_for_speech(text)
     if not spoken:
         return
-    path = os.path.join(tempfile.gettempdir(), f"jarvis_{int(time.time()*1000)}.mp3")
+    path = os.path.join(tempfile.gettempdir(), f"milo_{int(time.time()*1000)}.mp3")
     asyncio.run(edge_tts.Communicate(spoken, VOICE).save(path))
     if not pygame.mixer.get_init():
         pygame.mixer.init()
@@ -248,7 +248,7 @@ def voice_loop():
 
     def on_press(key):
         if key == keyboard.Key.f9:
-            if _speaking.is_set():          # interrupt Jarvis mid-sentence
+            if _speaking.is_set():          # interrupt MILO mid-sentence
                 _speaking.clear()
                 return
             if not recording.is_set():
@@ -264,7 +264,7 @@ def voice_loop():
     stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=audio_cb)
     stream.start()
     keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True).start()
-    print(f"\nJarvis online. Hold F9 to talk, Ctrl+C to quit.\n")
+    print(f"\nMILO online. Hold F9 to talk, Ctrl+C to quit.\n")
     speak(f"Online and ready, {USER_NAME}.")
 
     while True:
@@ -288,20 +288,20 @@ def handle(text: str):
         reply = think(text)
     except anthropic.APIError as e:
         reply = f"I hit an API error: {e}"
-    print(f"Jarvis: {reply}\n")
+    print(f"MILO: {reply}\n")
     try:
         speak(reply)
     except Exception as e:
         print(f"   (TTS failed: {e})")
 
 def text_loop():
-    print("Jarvis text mode. Type 'quit' to exit.\n")
+    print("MILO text mode. Type 'quit' to exit.\n")
     while True:
         text = input("You: ").strip()
         if text.lower() in ("quit", "exit"):
             break
         if text:
-            handle(text) if "--speak" in sys.argv else print(f"Jarvis: {think(text)}\n")
+            handle(text) if "--speak" in sys.argv else print(f"MILO: {think(text)}\n")
 
 if __name__ == "__main__":
     if not os.getenv("ANTHROPIC_API_KEY"):
@@ -309,4 +309,4 @@ if __name__ == "__main__":
     try:
         text_loop() if "--text" in sys.argv else voice_loop()
     except KeyboardInterrupt:
-        print("\nJarvis offline.")
+        print("\nMILO offline.")
