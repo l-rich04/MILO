@@ -4,7 +4,7 @@ MILO - push-to-talk voice assistant
   Press F9 while MILO is talking to interrupt.
   Run with --text to type instead of talk (good for debugging tools).
 
-Stack: faster-whisper (STT) -> Claude w/ tools (brain) -> edge-tts + pygame (TTS)
+Stack: faster-whisper (STT) -> local LLM via Ollama w/ tools (brain) -> edge-tts + pygame (TTS)
 """
 
 import asyncio
@@ -19,17 +19,19 @@ import tempfile
 import threading
 import time
 
-import anthropic
+import ollama
 
 from milo_logger import log_interaction
 
 # ─────────────────────────── Config ───────────────────────────
-MODEL = os.getenv("MILO_MODEL", "claude-sonnet-5-5")
+MODEL = os.getenv("MILO_MODEL", "gemma4:e4b")              # any Ollama model with tool support
 WHISPER_MODEL = os.getenv("MILO_WHISPER", "small.en")   # tiny.en / base.en / small.en / medium.en
 VOICE = os.getenv("MILO_VOICE", "en-GB-RyanNeural")      # `edge-tts --list-voices` for more
 USER_NAME = os.getenv("MILO_USER", "Layne")
 SAMPLE_RATE = 16000
 MAX_HISTORY = 30          # messages kept in context
+MAX_TOOL_ROUNDS = 5       # stop if the model keeps calling tools without answering
+CONTEXT_SIZE = 8192       # tokens the model can "see" at once
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milo.db")
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -41,7 +43,6 @@ Your replies are spoken aloud, so:
 Use tools when they help. For shell commands prefer simple, safe, read-only commands unless the user clearly asks for a change.
 Current date/time is available via the get_datetime tool."""
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 
 # ─────────────────────────── Memory (SQLite) ───────────────────────────
 def db():
@@ -114,6 +115,7 @@ def tool_get_notes(query: str = "") -> str:
     return "\n".join(f"[{r[0]}] {r[1]}: {r[2]}" for r in rows) or "No notes found."
 
 def tool_delete_note(note_id: int) -> str:
+    note_id = int(note_id)   # small models sometimes send numbers as text
     with db() as conn:
         n = conn.execute("DELETE FROM notes WHERE id = ?", (note_id,)).rowcount
     return "Deleted." if n else f"No note with id {note_id}."
@@ -133,8 +135,15 @@ TOOL_FUNCS = {
 }
 
 def schema(name, desc, props=None, required=None):
-    return {"name": name, "description": desc,
-            "input_schema": {"type": "object", "properties": props or {}, "required": required or []}}
+    """Build one tool description in the format Ollama expects."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc,
+            "parameters": {"type": "object", "properties": props or {}, "required": required or []},
+        },
+    }
 
 TOOLS = [
     schema("run_shell_command", "Run a command in the system shell (cmd.exe on Windows) and return its output. "
@@ -149,48 +158,57 @@ TOOLS = [
            {"query": {"type": "string"}}),
     schema("delete_note", "Delete a saved note by id.", {"note_id": {"type": "integer"}}, ["note_id"]),
     schema("get_datetime", "Get the current local date and time."),
-    # Server-side tool: Anthropic runs the search, no local code needed
-    {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
 ]
 
 # ─────────────────────────── Brain ───────────────────────────
 history = []
 
+def role_of(m):
+    """Messages can be plain dicts (ours) or Message objects (from Ollama)."""
+    return m["role"] if isinstance(m, dict) else m.role
+
 def trim_history():
-    """Keep history bounded without splitting a tool_use / tool_result pair."""
+    """Keep history bounded, cutting only at one of the user's own messages
+    so a tool request is never separated from its result."""
     global history
     if len(history) <= MAX_HISTORY:
         return
     for i in range(len(history) - MAX_HISTORY, len(history)):
-        m = history[i]
-        if m["role"] == "user" and isinstance(m["content"], str):
+        if role_of(history[i]) == "user":
             history = history[i:]
             return
 
 def think(user_text: str) -> str:
     history.append({"role": "user", "content": user_text})
     trim_history()
-    while True:
-        resp = client.messages.create(model=MODEL, max_tokens=1024, system=SYSTEM_PROMPT,
-                                      tools=TOOLS, messages=history)
-        history.append({"role": "assistant", "content": resp.content})
 
-        if resp.stop_reason == "pause_turn":      # long server-side tool turn; let it continue
-            continue
-        if resp.stop_reason != "tool_use":
-            return " ".join(b.text for b in resp.content if b.type == "text").strip()
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+            tools=TOOLS,
+            think=False,                       # skip "thinking mode" for faster replies
+            keep_alive="30m",                  # keep the model loaded on the GPU
+            options={"num_ctx": CONTEXT_SIZE},
+        )
+        message = response.message
+        history.append(message)
 
-        results = []
-        for block in resp.content:
-            if block.type == "tool_use":
-                print(f"   🔧 {block.name}({block.input})")
-                fn = TOOL_FUNCS.get(block.name)
-                try:
-                    out = fn(**block.input) if fn else f"Unknown tool {block.name}"
-                except Exception as e:
-                    out = f"Tool error: {e}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(out)})
-        history.append({"role": "user", "content": results})
+        if not message.tool_calls:             # no tools requested: this is the answer
+            return (message.content or "").strip()
+
+        for call in message.tool_calls:
+            name = call.function.name
+            args = call.function.arguments or {}
+            print(f"   🔧 {name}({args})")
+            fn = TOOL_FUNCS.get(name)
+            try:
+                out = fn(**args) if fn else f"Unknown tool {name}"
+            except Exception as e:
+                out = f"Tool error: {e}"
+            history.append({"role": "tool", "content": str(out), "tool_name": name})
+
+    return "Sorry, I got stuck trying to use my tools. Could you rephrase that?"
 
 # ─────────────────────────── Voice out (TTS) ───────────────────────────
 _speaking = threading.Event()
@@ -288,8 +306,8 @@ def voice_loop():
 def handle(text: str, speak_reply: bool = True):
     try:
         reply = think(text)
-    except anthropic.APIError as e:
-        reply = f"I hit an API error: {e}"
+    except Exception as e:
+        reply = f"I couldn't reach my brain. Is Ollama running? ({e})"
 
     # Log every interaction before speaking, so a speech error can't lose it.
     # Category and whether it worked are unknown for now; MILO will learn to fill these in.
@@ -312,8 +330,10 @@ def text_loop():
             handle(text, speak_reply="--speak" in sys.argv)
 
 if __name__ == "__main__":
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        sys.exit("Set ANTHROPIC_API_KEY first.")
+    try:
+        ollama.show(MODEL)                     # check Ollama is running and the model is downloaded
+    except Exception:
+        sys.exit(f"Can't use '{MODEL}'. Make sure Ollama is running, then try: ollama pull {MODEL}")
     try:
         text_loop() if "--text" in sys.argv else voice_loop()
     except KeyboardInterrupt:
