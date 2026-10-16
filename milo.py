@@ -21,6 +21,8 @@ import time
 
 import anthropic
 
+from milo_logger import log_interaction
+
 # ─────────────────────────── Config ───────────────────────────
 MODEL = os.getenv("MILO_MODEL", "claude-sonnet-5-5")
 WHISPER_MODEL = os.getenv("MILO_WHISPER", "small.en")   # tiny.en / base.en / small.en / medium.en
@@ -283,16 +285,22 @@ def voice_loop():
             continue
         handle(text)
 
-def handle(text: str):
+def handle(text: str, speak_reply: bool = True):
     try:
         reply = think(text)
     except anthropic.APIError as e:
         reply = f"I hit an API error: {e}"
+
+    # Log every interaction before speaking, so a speech error can't lose it.
+    # Category and whether it worked are unknown for now; MILO will learn to fill these in.
+    log_interaction(text, "unknown", "unknown")
+
     print(f"MILO: {reply}\n")
-    try:
-        speak(reply)
-    except Exception as e:
-        print(f"   (TTS failed: {e})")
+    if speak_reply:
+        try:
+            speak(reply)
+        except Exception as e:
+            print(f"   (TTS failed: {e})")
 
 def text_loop():
     print("MILO text mode. Type 'quit' to exit.\n")
@@ -301,7 +309,7 @@ def text_loop():
         if text.lower() in ("quit", "exit"):
             break
         if text:
-            handle(text) if "--speak" in sys.argv else print(f"MILO: {think(text)}\n")
+            handle(text, speak_reply="--speak" in sys.argv)
 
 if __name__ == "__main__":
     if not os.getenv("ANTHROPIC_API_KEY"):

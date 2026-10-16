@@ -12,4 +12,3 @@ def log_interaction(command, category, worked):
         writer.writerow([datetime.now(), command, category, worked])
 
     print("Logged a row to milo_log.csv")
-

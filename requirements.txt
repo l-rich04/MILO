@@ -1,7 +1,17 @@
-anthropic
+# MILO's Python packages. Install with: pip install -r requirements.txt
+
+# Brain
+ollama          # talks to the local model running in Ollama
+anthropic       # Claude API (old brain; remove once the Ollama version works)
+
+# Hearing (speech-to-text)
 faster-whisper
 sounddevice
 numpy
+
+# Push-to-talk key
 pynput
+
+# Speaking (text-to-speech)
 edge-tts
 pygame
