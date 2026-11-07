@@ -108,6 +108,20 @@ def tool_add_note(text: str) -> str:
                      (datetime.datetime.now().isoformat(timespec="minutes"), text))
     return "Note saved."
 
+def tool_set_timer(minutes: int) -> str:
+    minutes = float(minutes)
+    if minutes <= 0:
+        return "Timer must be longer than 0 minutes."
+    def timer_thread():
+        time.sleep(minutes * 60)
+        print(f"\n⏰ Timer for {minutes:g} minutes is up!")
+        try:
+            speak(f"Timer for {minutes:g} minutes is up!")
+        except Exception as e:
+            print(f"   (TTS failed: {e})")
+    threading.Thread(target=timer_thread, daemon=True).start()
+    return f"Timer set for {minutes:g} minutes."
+
 def tool_get_notes(query: str = "") -> str:
     with db() as conn:
         rows = conn.execute("SELECT id, created, text FROM notes WHERE text LIKE ? ORDER BY id DESC LIMIT 20",
@@ -132,6 +146,7 @@ TOOL_FUNCS = {
     "get_notes": tool_get_notes,
     "delete_note": tool_delete_note,
     "get_datetime": tool_get_datetime,
+    "set_timer": tool_set_timer,
 }
 
 def schema(name, desc, props=None, required=None):
@@ -158,6 +173,7 @@ TOOLS = [
            {"query": {"type": "string"}}),
     schema("delete_note", "Delete a saved note by id.", {"note_id": {"type": "integer"}}, ["note_id"]),
     schema("get_datetime", "Get the current local date and time."),
+    schema("set_timer", "Set a timer for a specified number of minutes.", {"minutes": {"type": "number"}}, ["minutes"]),
 ]
 
 # ─────────────────────────── Brain ───────────────────────────
