@@ -6,7 +6,7 @@ MILO - push-to-talk voice assistant
 
 Stack: faster-whisper (STT) -> local LLM via Ollama w/ tools (brain) -> edge-tts + pygame (TTS)
 """
-
+import requests
 import asyncio
 import datetime
 import os
@@ -20,6 +20,7 @@ import threading
 import time
 import math
 import ollama
+import requests
 from milo_logger import log_interaction
 from simpleeval import simple_eval
 
@@ -102,6 +103,61 @@ def tool_write_file(path: str, content: str) -> str:
         f.write(content)
     return f"Wrote {path}"
 
+WEATHER_CODES = {
+    0: "clear skies", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light showers", 81: "showers", 82: "heavy showers",
+    85: "snow showers", 86: "heavy snow showers",
+    95: "thunderstorms", 96: "thunderstorms with hail", 99: "thunderstorms with hail",
+}
+HOME = ("Johnstown, PA", 40.33, -78.92)
+
+
+def get_current_location():
+    """Guess the computer's location from its internet connection.
+    Falls back to HOME if the lookup fails."""
+    try:
+        info = requests.get("https://ipinfo.io/json", timeout=5).json()
+        lat, lon = map(float, info["loc"].split(","))
+        return f"{info['city']}, {info['region']}", lat, lon
+    except Exception:
+        return HOME
+    
+def tool_get_weather(city: str = "") -> str:
+    try:
+        if city.strip():
+            geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                               params={"name": city.split(",")[0].strip(), "count": 1},
+                               timeout=10).json()
+            if not geo.get("results"):
+                return f"Couldn't find a place called {city}."
+            place = geo["results"][0]
+            name = f"{place['name']}, {place.get('admin1', place.get('country', ''))}"
+            lat, lon = place["latitude"], place["longitude"]
+        else:
+            name, lat, lon = get_current_location()
+
+        data = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": lat, "longitude": lon,
+            "current": "temperature_2m,weather_code",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "temperature_unit": "fahrenheit",
+            "timezone": "auto", "forecast_days": 1,
+        }, timeout=10).json()
+
+        now = data["current"]
+        today = data["daily"]
+        sky = WEATHER_CODES.get(now["weather_code"], "unknown conditions")
+        return (f"Weather in {name}: {sky}, {now['temperature_2m']:.0f}°F right now. "
+                f"Today's high is {today['temperature_2m_max'][0]:.0f}°F, the low is "
+                f"{today['temperature_2m_min'][0]:.0f}°F, with a "
+                f"{today['precipitation_probability_max'][0]}% chance of precipitation.")
+    except requests.RequestException as e:
+        return f"Couldn't reach the weather service: {e}"
+
 def tool_add_note(text: str) -> str:
     with db() as conn:
         conn.execute("INSERT INTO notes (created, text) VALUES (?, ?)",
@@ -158,6 +214,7 @@ TOOL_FUNCS = {
     "get_datetime": tool_get_datetime,
     "set_timer": tool_set_timer,
     "calculate": tool_calculate,
+    "get_weather": tool_get_weather,
 }
 
 def schema(name, desc, props=None, required=None):
@@ -186,6 +243,8 @@ TOOLS = [
     schema("get_datetime", "Get the current local date and time."),
     schema("set_timer", "Set a timer for a specified number of minutes.", {"minutes": {"type": "number"}}, ["minutes"]),
     schema("calculate", "Evaluate a mathematical expression.", {"expression": {"type": "string"}}, ["expression"]),
+    schema("get_weather", "Get the current weather and today's forecast for a city. Leave the city empty for home.",
+           {"city": {"type": "string"}}),
 ]
 
 # ─────────────────────────── Brain ───────────────────────────
