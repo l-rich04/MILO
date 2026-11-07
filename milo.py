@@ -178,9 +178,11 @@ def trim_history():
             history = history[i:]
             return
 
-def think(user_text: str) -> str:
+def think(user_text: str):
+    """Returns two things: MILO's reply, and a list of the tools it used."""
     history.append({"role": "user", "content": user_text})
     trim_history()
+    tools_used = []
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = ollama.chat(
@@ -195,10 +197,11 @@ def think(user_text: str) -> str:
         history.append(message)
 
         if not message.tool_calls:             # no tools requested: this is the answer
-            return (message.content or "").strip()
+            return (message.content or "").strip(), tools_used
 
         for call in message.tool_calls:
             name = call.function.name
+            tools_used.append(name)
             args = call.function.arguments or {}
             print(f"   🔧 {name}({args})")
             fn = TOOL_FUNCS.get(name)
@@ -208,7 +211,7 @@ def think(user_text: str) -> str:
                 out = f"Tool error: {e}"
             history.append({"role": "tool", "content": str(out), "tool_name": name})
 
-    return "Sorry, I got stuck trying to use my tools. Could you rephrase that?"
+    return "Sorry, I got stuck trying to use my tools. Could you rephrase that?", tools_used
 
 # ─────────────────────────── Voice out (TTS) ───────────────────────────
 _speaking = threading.Event()
@@ -304,14 +307,18 @@ def voice_loop():
         handle(text)
 
 def handle(text: str, speak_reply: bool = True):
+    start = time.time()
     try:
-        reply = think(text)
+        reply, tools_used = think(text)
     except Exception as e:
         reply = f"I couldn't reach my brain. Is Ollama running? ({e})"
+        tools_used = []
+    response_time = round(time.time() - start, 2)
 
     # Log every interaction before speaking, so a speech error can't lose it.
     # Category and whether it worked are unknown for now; MILO will learn to fill these in.
-    log_interaction(text, "unknown", "unknown")
+    tools_text = ", ".join(tools_used) if tools_used else "none"
+    log_interaction(text, tools_text, reply, response_time, "unknown", "unknown")
 
     print(f"MILO: {reply}\n")
     if speak_reply:
