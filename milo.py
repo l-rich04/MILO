@@ -264,13 +264,10 @@ def speak(text: str):
 # ─────────────────────────── Voice in (push-to-talk + STT) ───────────────────────────
 def load_whisper():
     from faster_whisper import WhisperModel
-    try:
-        import ctranslate2
-        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-    except Exception:
-        device = "cpu"
+    device = os.getenv("MILO_WHISPER_DEVICE", "cpu")   # set to "cuda" once NVIDIA's libraries are installed
     compute = "float16" if device == "cuda" else "int8"
     print(f"Loading Whisper '{WHISPER_MODEL}' on {device}...")
+    
     return WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
 
 def voice_loop():
