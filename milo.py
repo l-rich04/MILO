@@ -18,10 +18,10 @@ import sys
 import tempfile
 import threading
 import time
-
+import math
 import ollama
-
 from milo_logger import log_interaction
+from simpleeval import simple_eval
 
 # ─────────────────────────── Config ───────────────────────────
 MODEL = os.getenv("MILO_MODEL", "gemma4:e4b")              # any Ollama model with tool support
@@ -108,6 +108,16 @@ def tool_add_note(text: str) -> str:
                      (datetime.datetime.now().isoformat(timespec="minutes"), text))
     return "Note saved."
 
+def tool_calculate(expression: str) -> str:
+    functions = {"sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+                 "tan": math.tan, "log": math.log10, "ln": math.log}
+    names = {"pi": math.pi, "e": math.e}
+    try:
+        result = simple_eval(expression, functions=functions, names=names)
+        return f"{expression} = {result:g}"
+    except Exception as e:
+        return f"Couldn't calculate that: {e}"
+
 def tool_set_timer(minutes: int) -> str:
     minutes = float(minutes)
     if minutes <= 0:
@@ -147,6 +157,7 @@ TOOL_FUNCS = {
     "delete_note": tool_delete_note,
     "get_datetime": tool_get_datetime,
     "set_timer": tool_set_timer,
+    "calculate": tool_calculate,
 }
 
 def schema(name, desc, props=None, required=None):
@@ -174,6 +185,7 @@ TOOLS = [
     schema("delete_note", "Delete a saved note by id.", {"note_id": {"type": "integer"}}, ["note_id"]),
     schema("get_datetime", "Get the current local date and time."),
     schema("set_timer", "Set a timer for a specified number of minutes.", {"minutes": {"type": "number"}}, ["minutes"]),
+    schema("calculate", "Evaluate a mathematical expression.", {"expression": {"type": "string"}}, ["expression"]),
 ]
 
 # ─────────────────────────── Brain ───────────────────────────
