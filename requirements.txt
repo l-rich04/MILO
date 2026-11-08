@@ -13,4 +13,4 @@ pynput
 
 # Speaking (text-to-speech)
 edge-tts
-pygame
+pygamespotipy

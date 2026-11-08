@@ -6,6 +6,9 @@ MILO - push-to-talk voice assistant
 
 Stack: faster-whisper (STT) -> local LLM via Ollama w/ tools (brain) -> edge-tts + pygame (TTS)
 """
+
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
 import asyncio
 import datetime
 import os
@@ -59,6 +62,68 @@ def db():
     return conn
 
 # ─────────────────────────── Tools ───────────────────────────
+_spotify = None
+
+def spotify():
+    """Connect to Spotify the first time it's needed, then reuse the connection."""
+    global _spotify
+    if _spotify is None:
+        _spotify = spotipy.Spotify(auth_manager=SpotifyOAuth(
+            scope="user-read-playback-state user-modify-playback-state",
+            cache_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache"),
+        ))
+    return _spotify
+
+def pick_device(sp):
+    """Use the device that's already playing, or any open Spotify device."""
+    devices = sp.devices()["devices"]
+    if not devices:
+        return None
+    active = [d for d in devices if d["is_active"]]
+    return (active or devices)[0]["id"]
+
+def tool_play_music(query: str, kind: str = "track") -> str:
+    sp = spotify()
+    device = pick_device(sp)
+    if device is None:
+        return "Spotify isn't open on any device. Open the Spotify app first."
+    if kind not in ("track", "artist", "album", "playlist"):
+        kind = "track"
+    results = sp.search(q=query, type=kind, limit=1)
+    items = [i for i in results[kind + "s"]["items"] if i]
+    if not items:
+        return f"Couldn't find a {kind} matching '{query}'."
+    item = items[0]
+    if kind == "track":
+        sp.start_playback(device_id=device, uris=[item["uri"]])
+        return f"Playing {item['name']} by {item['artists'][0]['name']}."
+    sp.start_playback(device_id=device, context_uri=item["uri"])
+    return f"Playing the {kind} {item['name']}."
+
+def tool_spotify_control(action: str) -> str:
+    sp = spotify()
+    action = action.lower().strip()
+    if action == "now_playing":
+        current = sp.current_playback()
+        if current and current.get("item"):
+            song = current["item"]
+            return f"Now playing {song['name']} by {song['artists'][0]['name']}."
+        return "Nothing is playing right now."
+    device = pick_device(sp)
+    if device is None:
+        return "Spotify isn't open on any device. Open the Spotify app first."
+    if action == "pause":
+        sp.pause_playback(device_id=device)
+    elif action == "resume":
+        sp.start_playback(device_id=device)
+    elif action == "next":
+        sp.next_track(device_id=device)
+    elif action == "previous":
+        sp.previous_track(device_id=device)
+    else:
+        return f"Unknown Spotify action: {action}"
+    return f"Done: {action}."
+
 def confirm(action: str) -> bool:
     print(f"\n⚠️  MILO wants to: {action}")
     return input("   Allow? [y/N]: ").strip().lower() == "y"
@@ -247,6 +312,9 @@ TOOL_FUNCS = {
     "calculate": tool_calculate,
     "get_weather": tool_get_weather,
     "read_textbook_page": tool_read_textbook_page,
+    "play_music": tool_play_music,
+    "spotify_control": tool_spotify_control,
+    
 }
 
 def schema(name, desc, props=None, required=None):
@@ -280,6 +348,10 @@ TOOLS = [
     schema("read_textbook_page", "Read a page of the user's Electromagnetics textbook aloud. "
            "Use the page number printed in the book, exactly as the user says it.",
            {"page": {"type": "integer"}}, ["page"]),
+    schema("play_music", "Search Spotify and play the best matching track, artist, album, or playlist.",
+           {"query": {"type": "string"}, "kind": {"type": "string"}}, ["query"]),
+    schema("spotify_control", "Control Spotify playback. Actions: now_playing, pause, resume, next, previous.",
+           {"action": {"type": "string"}}, ["action"]),
 ]
 
 # ─────────────────────────── Brain ───────────────────────────
@@ -380,17 +452,66 @@ def load_whisper():
     
     return WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
 
+WAKE_ENABLED = os.getenv("MILO_WAKE", "on") == "on"    # set to "off" for push-to-talk only
+WAKE_PATTERN = re.compile(r"^\s*(hey[\s,]+)?(milo|mylo|my\s?lo|mi\s?lo|mila)\b[\s,.!?]*", re.IGNORECASE)
+BLOCK_SECONDS = 0.1        # the mic delivers audio in 0.1-second blocks
+SILENCE_SECONDS = 0.8      # this much quiet means you stopped talking
+MAX_PHRASE_SECONDS = 10    # longer than this is probably music or TV, so ignore it
+FOLLOW_UP_SECONDS = 8      # after "MILO?" alone, how long to wait for the command
+
 def voice_loop():
+    import collections
+    import queue
     import numpy as np
     import sounddevice as sd
     from pynput import keyboard
 
     whisper = load_whisper()
-    frames, recording, done = [], threading.Event(), threading.Event()
+    block_size = int(SAMPLE_RATE * BLOCK_SECONDS)
+    jobs = queue.Queue()               # recordings waiting to be transcribed: (audio, source)
+    recording = threading.Event()      # True while F9 is held
+    ptt_frames = []
+    wake = {"phrase": [], "quiet_blocks": 0, "talking": False,
+            "preroll": collections.deque(maxlen=3), "noise": [], "threshold": None}
+
+    def reset_wake():
+        wake["phrase"], wake["quiet_blocks"], wake["talking"] = [], 0, False
 
     def audio_cb(indata, n, t, status):
-        if recording.is_set():
-            frames.append(indata.copy())
+        block = indata[:, 0].copy()
+        if recording.is_set():                         # push-to-talk takes priority
+            ptt_frames.append(block)
+            return
+        if not WAKE_ENABLED or _speaking.is_set():     # don't listen to MILO's own voice
+            reset_wake()
+            return
+
+        level = float(np.sqrt(np.mean(block ** 2)))    # loudness of this block (RMS)
+        if wake["threshold"] is None:                  # first second: measure room noise
+            wake["noise"].append(level)
+            if len(wake["noise"]) >= 10:
+                wake["threshold"] = max(0.01, 3 * float(np.mean(wake["noise"])))
+            return
+
+        if level > wake["threshold"]:
+            if not wake["talking"]:                    # speech just started:
+                wake["phrase"] = list(wake["preroll"]) # keep the moment before it, too
+                wake["talking"] = True
+            wake["phrase"].append(block)
+            wake["quiet_blocks"] = 0
+        elif wake["talking"]:
+            wake["phrase"].append(block)
+            wake["quiet_blocks"] += 1
+            if wake["quiet_blocks"] * BLOCK_SECONDS >= SILENCE_SECONDS:   # speech ended
+                audio = np.concatenate(wake["phrase"])
+                if 0.5 <= len(audio) / SAMPLE_RATE <= MAX_PHRASE_SECONDS:
+                    jobs.put((audio, "wake"))
+                reset_wake()
+        else:
+            wake["preroll"].append(block)
+
+        if len(wake["phrase"]) * BLOCK_SECONDS > MAX_PHRASE_SECONDS:     # never-ending sound
+            reset_wake()
 
     def on_press(key):
         if key == keyboard.Key.f9:
@@ -398,36 +519,59 @@ def voice_loop():
                 _speaking.clear()
                 return
             if not recording.is_set():
-                frames.clear()
+                ptt_frames.clear()
+                reset_wake()
                 recording.set()
                 print("🎙️  Listening...", end="", flush=True)
 
     def on_release(key):
         if key == keyboard.Key.f9 and recording.is_set():
             recording.clear()
-            done.set()
+            if ptt_frames:
+                jobs.put((np.concatenate(ptt_frames), "ptt"))
 
-    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=audio_cb)
+    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                            blocksize=block_size, callback=audio_cb)
     stream.start()
     keyboard.Listener(on_press=on_press, on_release=on_release, daemon=True).start()
-    print(f"\nMILO online. Hold F9 to talk, Ctrl+C to quit.\n")
+    how = "Hold F9 or say \"MILO\" to talk" if WAKE_ENABLED else "Hold F9 to talk"
+    print(f"\nMILO online. {how}. Ctrl+C to quit.\n")
     speak(f"Online and ready, {USER_NAME}.")
 
+    follow_up_until = 0
     while True:
-        done.wait()
-        done.clear()
-        if not frames:
-            continue
-        audio = np.concatenate(frames).flatten()
-        if len(audio) < SAMPLE_RATE * 0.4:     # ignore accidental taps
+        audio, source = jobs.get()
+        if source == "ptt" and len(audio) < SAMPLE_RATE * 0.4:     # ignore accidental taps
             print(" (too short)")
             continue
-        segments, _ = whisper.transcribe(audio, language="en", vad_filter=True, beam_size=5)
+
+        segments, _ = whisper.transcribe(audio, language="en", vad_filter=True, beam_size=5,
+                                         initial_prompt="Hey MILO.")
         text = " ".join(s.text for s in segments).strip()
-        print(f"\rYou: {text}           ")
         if not text:
             continue
-        handle(text)
+
+        if source == "ptt":
+            print(f"\rYou: {text}           ")
+            handle(text)
+            continue
+
+        # Heard through the always-on mic: only act if it's meant for MILO.
+        match = WAKE_PATTERN.match(text)
+        if match:
+            command = text[match.end():].strip()
+        elif time.time() < follow_up_until:
+            command = text                 # answering MILO's "Yes?"
+        else:
+            continue                       # someone talking, but not to MILO
+
+        print(f"You: {text}")
+        if not command:                    # just "MILO" on its own
+            follow_up_until = time.time() + FOLLOW_UP_SECONDS
+            speak("Yes?")
+            continue
+        follow_up_until = 0
+        handle(command)
 
 def handle(text: str, speak_reply: bool = True):
     start = time.time()
