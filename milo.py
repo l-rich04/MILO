@@ -6,7 +6,6 @@ MILO - push-to-talk voice assistant
 
 Stack: faster-whisper (STT) -> local LLM via Ollama w/ tools (brain) -> edge-tts + pygame (TTS)
 """
-import requests
 import asyncio
 import datetime
 import os
@@ -18,8 +17,10 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import math
 import ollama
+import pymupdf
 import requests
 from milo_logger import log_interaction
 from simpleeval import simple_eval
@@ -33,6 +34,9 @@ SAMPLE_RATE = 16000
 MAX_HISTORY = 30          # messages kept in context
 MAX_TOOL_ROUNDS = 5       # stop if the model keeps calling tools without answering
 CONTEXT_SIZE = 8192       # tokens the model can "see" at once
+TEXTBOOK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "textbooks", "electromagnetics.pdf")
+PAGE_OFFSET = 13          # PDF index = book page + 13 (14 front pages, minus 1 for counting from 0)
+DIRECT_REPLY_TOOLS = {"read_textbook_page"}   # tools whose output IS the reply
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milo.db")
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -203,6 +207,33 @@ def tool_delete_note(note_id: int) -> str:
 def tool_get_datetime() -> str:
     return datetime.datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
 
+CLEANUP_PROMPT = """You turn textbook pages into text that can be read aloud. Rules:
+- Keep every normal sentence word for word. Do not summarize, explain, or add anything.
+- Say equations in words, for example "z one equals x one plus j y one". Mention equation numbers, like "equation 1.44".
+- Skip page headers, page numbers, and scattered figure labels. For each figure, just say its name and caption, like "Figure 1-18: relation between rectangular and polar representations of a complex number."
+- Output only the text to be read aloud."""
+
+def tool_read_textbook_page(page: int) -> str:
+    page = int(page)
+    with pymupdf.open(TEXTBOOK_PATH) as doc:
+        index = page + PAGE_OFFSET
+        if not 0 <= index < doc.page_count:
+            return f"Page {page} isn't in the textbook."
+        raw = doc[index].get_text()
+        raw = unicodedata.normalize("NFKC", raw)   # turn special characters like "ﬁ" into plain "fi"
+
+    print(f"\n----- Original text of page {page} -----\n{raw}\n----- end of page {page} -----\n")
+
+    response = ollama.chat(
+        model=MODEL,
+        messages=[{"role": "system", "content": CLEANUP_PROMPT},
+                  {"role": "user", "content": raw}],
+        think=False,
+        keep_alive="30m",
+        options={"num_ctx": CONTEXT_SIZE},
+    )
+    return f"Page {page}. " + (response.message.content or "").strip()
+
 TOOL_FUNCS = {
     "run_shell_command": tool_run_shell_command,
     "open_app": tool_open_app,
@@ -215,6 +246,7 @@ TOOL_FUNCS = {
     "set_timer": tool_set_timer,
     "calculate": tool_calculate,
     "get_weather": tool_get_weather,
+    "read_textbook_page": tool_read_textbook_page,
 }
 
 def schema(name, desc, props=None, required=None):
@@ -245,6 +277,9 @@ TOOLS = [
     schema("calculate", "Evaluate a mathematical expression.", {"expression": {"type": "string"}}, ["expression"]),
     schema("get_weather", "Get the current weather and today's forecast for a city. Leave the city empty for home.",
            {"city": {"type": "string"}}),
+    schema("read_textbook_page", "Read a page of the user's Electromagnetics textbook aloud. "
+           "Use the page number printed in the book, exactly as the user says it.",
+           {"page": {"type": "integer"}}, ["page"]),
 ]
 
 # ─────────────────────────── Brain ───────────────────────────
@@ -296,6 +331,10 @@ def think(user_text: str):
                 out = fn(**args) if fn else f"Unknown tool {name}"
             except Exception as e:
                 out = f"Tool error: {e}"
+            if name in DIRECT_REPLY_TOOLS:
+                history.append({"role": "tool", "content": "(The result was given to the user directly.)", "tool_name": name})
+                history.append({"role": "assistant", "content": "I read that to you."})
+                return str(out), tools_used
             history.append({"role": "tool", "content": str(out), "tool_name": name})
 
     return "Sorry, I got stuck trying to use my tools. Could you rephrase that?", tools_used

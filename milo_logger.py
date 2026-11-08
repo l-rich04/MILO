@@ -5,7 +5,8 @@ from datetime import datetime
 def log_interaction(command, tools_used, reply, response_time, category, worked):
     file_exists = os.path.exists("milo_log.csv")
 
-    with open("milo_log.csv", "a", newline="") as f:
+    # encoding="utf-8" so any character (like "ﬁ" or "°") can be saved
+    with open("milo_log.csv", "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(["time", "command", "category", "worked", "tools_used", "reply", "response_time"])

@@ -12,3 +12,6 @@ data/
 *.db
 *.wav
 *.mp3
+
+textbooks/
+*.pdf
